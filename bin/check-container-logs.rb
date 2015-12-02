@@ -14,39 +14,33 @@
 #
 # DEPENDENCIES:
 #   gem: sensu-plugin
-#   gem: docker
-#   gem: docker-api
+#   gem: net_http_unix
 #
 # USAGE:
-#   check-container-logs.rb -H /tmp/docker.sock -p unix -n logspout -r 'problem sending' -r 'i/o timeout' -i 'Remark:' -i 'The configuration is'
+#   check-container-logs.rb -H /tmp/docker.sock -n logspout -r 'problem sending' -r 'i/o timeout' -i 'Remark:' -i 'The configuration is'
 #   => 1 container running = OK
 #   => 4 container running = CRITICAL
 #
 # NOTES:
+#   The API parameter required to use the limited lookback (-t) was introduced
+#   the Docker server API version 1.19. This check may still work on older API
+#   versions if you don't want to limit the timestamps of logs.
 #
 # LICENSE:
-#   Author Nathan Newman  <newmannh@gmail.com>
+#   Author: Nathan Newman  <newmannh@gmail.com>, Kel Cecil <kelcecil@praisechaos.com>
 #   Released under the same terms as Sensu (the MIT license); see LICENSE
 #   for details.
 #
 
 require 'sensu-plugin/check/cli'
-require 'socket'
 require 'net_http_unix'
-require 'json'
 
 class ContainerLogChecker < Sensu::Plugin::Check::CLI
   option :docker_host,
-         description: 'location of docker api, host:port or /path/to/docker.sock',
+         description: 'location of docker api: host:port or /path/to/docker.sock',
          short: '-H DOCKER_HOST',
          long: '--docker-host DOCKER_HOST',
          default: '127.0.0.1:2375'
-
-  option :docker_protocol,
-         description: 'http or unix',
-         short: '-p PROTOCOL',
-         long: '--protocol PROTOCOL',
-         default: 'http'
 
   option :container,
          description: 'name of container',
@@ -55,33 +49,63 @@ class ContainerLogChecker < Sensu::Plugin::Check::CLI
          required: true
 
   option :red_flags,
-         description: 'substring whose presence (case-insensitive by default) in a log line indicates an error; can be used multiple times',
+         description: 'substring whose presence (case-insensitive by default) in a log line indicates an error; can be used multiple t
+imes',
          short: '-r "error occurred" -r "problem encountered" -r "error status"',
          long: '--red-flag "error occurred" --red-flag "problem encountered" --red-flag "error status"',
          default: [],
          proc: proc { |flag| (@options[:red_flags][:accumulated] ||= []).push(flag) }
 
   option :ignore_list,
-         description: 'substring whose presence (case-insensitive by default) in a log line indicates the line should be ignored; can be used multiple times',
+         description: 'substring whose presence (case-insensitive by default) in a log line indicates the line should be ignored; can
+be used multiple times',
          short: '-i "configuration:" -i "# Remark:"',
          long: '--ignore-lines-with "configuration:" --ignore-lines-with "# remark:"',
          default: [],
          proc: proc { |flag| (@options[:ignore_list][:accumulated] ||= []).push(flag) }
 
   option :case_sensitive,
-         description: 'indicates all red_flag and ignore_list substring matching should be case-sensitive instead of the default case-insensitive',
+         description: 'indicates all red_flag and ignore_list substring matching should be case-sensitive instead of the default case-
+insensitive',
          short: '-c',
          long: '--case-sensitive',
          boolean: true
 
-  def process_docker_logs(containerName)
-    path = "containers/#{containerName}/attach?logs=1&stream=0&stdout=1&stderr=1"
-    req = Net::HTTP::Post.new "/#{path}"
-    if config[:docker_protocol] == 'unix'
-      client = NetX::HTTPUnix.new("unix://#{config[:docker_host]}")
+  option :hours_ago,
+        description: 'Amount of time in hours to look back for log strings',
+        short: '-t HOURS',
+        long: '--hours-ago HOURS',
+        required: false
+
+  def calculate_timestamp(hours)
+    seconds_ago = hours.to_i * 3600
+    return (Time.now - seconds_ago).to_i
+  end
+
+  def create_client
+    client = nil
+    if config[:docker_host][0] == '/'
+      host = 'unix://' + config[:docker_host]
+      client = NetX::HTTPUnix.new(host)
     else
-      client = Net::HTTP.new("#{config[:docker_protocol]}://#{config[:docker_host]}")
+      split_host = config[:docker_host].split ':'
+      if split_host.length == 2
+        client = NetX::HTTPUnix.new(split_host[0], split_host[1])
+      else
+        client = NetX::HTTPUnix.new(config[:docker_host], 2375)
+      end
     end
+
+    client
+  end
+
+  def process_docker_logs(containerName)
+    client = create_client
+    path = "/containers/#{containerName}/logs?stdout=true&stderr=true"
+    if config.has_key? :hours_ago
+      path = "#{path}&since=#{calculate_timestamp config[:hours_ago]}"
+    end
+    req = Net::HTTP::Get.new path
     client.request req do |response|
       response.read_body do |chunk|
         yield remove_headers chunk
